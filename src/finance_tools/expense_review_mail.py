@@ -57,7 +57,7 @@ class DepartmentMail:
     department: str
     to_addrs: list[str] = field(default_factory=list)
     cc_addrs: list[str] = field(default_factory=list)
-    attachment: Path | None = None
+    attachments: list[Path] = field(default_factory=list)
 
 
 @dataclass
@@ -68,7 +68,7 @@ class PreparedMail:
     cc_addrs: list[str]
     subject: str
     body: str
-    attachment: Path | None
+    attachments: list[Path]
     skipped_reason: str | None = None
 
 
@@ -282,33 +282,47 @@ def load_department_mails(
             elif label_text.startswith("副"):
                 cc_addrs.append(addr)
 
-        attachment = find_attachment(venue, department, attachment_dir)
+        attachments = find_attachments(venue, department, attachment_dir)
         depts.append(
             DepartmentMail(
                 venue=venue,
                 department=department,
                 to_addrs=_dedupe_preserve(to_addrs),
                 cc_addrs=_dedupe_preserve(cc_addrs),
-                attachment=attachment,
+                attachments=attachments,
             )
         )
     return depts
 
 
-def find_attachment(
+def find_attachments(
     venue: str, department: str, attachment_dir: Path = ATTACHMENT_DIR
-) -> Path | None:
+) -> list[Path]:
+    """Resolve attachment files for a department.
+
+    If the department name contains「合併」(e.g. 中餐廳合併), attach every
+    workbook whose filename contains the base name (中餐廳).
+    Otherwise attach the single best-matching file.
+    """
     folder = attachment_dir / venue
     if not folder.exists():
-        return None
+        return []
     candidates = sorted(folder.glob("*.xlsx"))
+
+    if "合併" in department:
+        base = department.replace("合併", "").strip()
+        if not base:
+            return []
+        merged = [p for p in candidates if base in p.stem]
+        return merged
+
     exact = [p for p in candidates if p.stem.endswith(department) or p.stem == department]
     if exact:
-        return exact[0]
+        return [exact[0]]
     loose = [p for p in candidates if department in p.stem]
     if len(loose) == 1:
-        return loose[0]
-    return None
+        return loose
+    return []
 
 
 def render_body(schedule: ScheduleInfo) -> str:
@@ -338,7 +352,7 @@ def prepare_mails(
     for venue in venues:
         for dept in load_department_mails(venue):
             subject = render_subject(schedule, dept.department)
-            if not dept.attachment:
+            if not dept.attachments:
                 prepared.append(
                     PreparedMail(
                         venue=dept.venue,
@@ -347,7 +361,7 @@ def prepare_mails(
                         cc_addrs=[],
                         subject=subject,
                         body=body,
-                        attachment=None,
+                        attachments=[],
                         skipped_reason="找不到對應夾檔",
                     )
                 )
@@ -371,7 +385,7 @@ def prepare_mails(
                         cc_addrs=cc_addrs,
                         subject=subject,
                         body=body,
-                        attachment=dept.attachment,
+                        attachments=dept.attachments,
                         skipped_reason="沒有收件者",
                     )
                 )
@@ -385,7 +399,7 @@ def prepare_mails(
                     cc_addrs=cc_addrs,
                     subject=subject,
                     body=body,
-                    attachment=dept.attachment,
+                    attachments=dept.attachments,
                 )
             )
     return prepared
@@ -441,17 +455,19 @@ def build_email_message(mail: PreparedMail, sender: str) -> EmailMessage:
     msg["Subject"] = mail.subject
     msg.set_content(mail.body)
 
-    if mail.attachment and mail.attachment.exists():
-        ctype, _ = mimetypes.guess_type(str(mail.attachment))
+    for path in mail.attachments:
+        if not path.exists():
+            continue
+        ctype, _ = mimetypes.guess_type(str(path))
         if ctype is None:
             maintype, subtype = "application", "octet-stream"
         else:
             maintype, subtype = ctype.split("/", 1)
         msg.add_attachment(
-            mail.attachment.read_bytes(),
+            path.read_bytes(),
             maintype=maintype,
             subtype=subtype,
-            filename=mail.attachment.name,
+            filename=path.name,
         )
     return msg
 
@@ -468,14 +484,15 @@ def send_via_smtp(
         return
 
     logging.info(
-        "%s %s/%s | Subject=%s | To=%s | Cc=%s | 附件=%s",
+        "%s %s/%s | Subject=%s | To=%s | Cc=%s | 附件(%s)=%s",
         "DRY-RUN" if dry_run else "SEND",
         mail.venue,
         mail.department,
         mail.subject,
         ";".join(mail.to_addrs),
         ";".join(mail.cc_addrs),
-        mail.attachment.name if mail.attachment else "",
+        len(mail.attachments),
+        ";".join(p.name for p in mail.attachments),
     )
     if dry_run:
         return
