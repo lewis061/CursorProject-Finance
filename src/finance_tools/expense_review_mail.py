@@ -172,40 +172,78 @@ def _as_md_text(value: object) -> str:
     return text
 
 
-def load_schedule(
+def load_schedules(
     review_month: int,
     western_year: int,
     content_file: Path = CONTENT_FILE,
-) -> ScheduleInfo:
-    df = pd.read_excel(content_file)
-    cols = {str(c).strip(): c for c in df.columns}
-    month_col = cols.get("費用檢討月份")
-    meeting_col = cols.get("開會日期")
-    deadline_col = cols.get("資料繳交日期")
-    if not month_col or not meeting_col or not deadline_col:
-        raise ValueError(
-            f"MAIL內文.xlsx 缺少必要欄位，實際欄位: {list(df.columns)}"
-        )
+) -> dict[str, ScheduleInfo]:
+    """Load per-venue meeting/deadline from MAIL內文.xlsx.
 
-    match = df[df[month_col].astype(int) == int(review_month)]
-    if match.empty:
+    Expected layout (header=None):
+      row0: 館別 | 高雄 | 高雄 | 南投 | 南投 | 台北 | 台北
+      row1: 費用檢討月份 | 開會日期 | 資料繳交日期 | ...
+      row2+: month | dates...
+    """
+    df = pd.read_excel(content_file, header=None)
+    if df.shape[0] < 3 or df.shape[1] < 3:
+        raise ValueError(f"MAIL內文.xlsx 格式異常: {df.shape}")
+
+    # Map venue -> (meeting_col, deadline_col)
+    venue_cols: dict[str, tuple[int, int]] = {}
+    col = 1
+    while col < df.shape[1]:
+        venue = df.iloc[0, col]
+        venue_name = "" if venue is None or (isinstance(venue, float) and pd.isna(venue)) else str(venue).strip()
+        if venue_name in VENUES:
+            meeting_col = col
+            deadline_col = col + 1 if col + 1 < df.shape[1] else None
+            if deadline_col is None:
+                raise ValueError(f"MAIL內文.xlsx 館別 {venue_name} 缺少資料繳交日期欄")
+            venue_cols[venue_name] = (meeting_col, deadline_col)
+            col += 2
+        else:
+            col += 1
+
+    if not venue_cols:
+        raise ValueError("MAIL內文.xlsx 找不到台北/南投/高雄欄位")
+
+    month_row = None
+    for row_idx in range(2, df.shape[0]):
+        cell = df.iloc[row_idx, 0]
+        try:
+            if int(cell) == int(review_month):
+                month_row = row_idx
+                break
+        except (TypeError, ValueError):
+            continue
+    if month_row is None:
         raise ValueError(
             f"MAIL內文.xlsx 找不到費用檢討月份={review_month} 的資料"
         )
-    row = match.iloc[0]
-    meeting_raw = _as_md_text(row[meeting_col])
-    deadline = _as_md_text(row[deadline_col])
-    meeting_with_weekday = format_meeting_with_weekday(
-        meeting_raw, reference_year=western_year, raw_value=row[meeting_col]
-    )
-    return ScheduleInfo(
-        review_month=int(review_month),
-        western_year=western_year,
-        roc_year=to_roc_year(western_year),
-        meeting_raw=meeting_raw,
-        meeting_with_weekday=meeting_with_weekday,
-        deadline=deadline,
-    )
+
+    schedules: dict[str, ScheduleInfo] = {}
+    for venue, (meeting_col, deadline_col) in venue_cols.items():
+        meeting_val = df.iloc[month_row, meeting_col]
+        deadline_val = df.iloc[month_row, deadline_col]
+        meeting_raw = _as_md_text(meeting_val)
+        deadline = _as_md_text(deadline_val)
+        if not meeting_raw or not deadline:
+            raise ValueError(
+                f"MAIL內文.xlsx 館別={venue} 月份={review_month} "
+                f"開會日期或資料繳交日期空白"
+            )
+        meeting_with_weekday = format_meeting_with_weekday(
+            meeting_raw, reference_year=western_year, raw_value=meeting_val
+        )
+        schedules[venue] = ScheduleInfo(
+            review_month=int(review_month),
+            western_year=western_year,
+            roc_year=to_roc_year(western_year),
+            meeting_raw=meeting_raw,
+            meeting_with_weekday=meeting_with_weekday,
+            deadline=deadline,
+        )
+    return schedules
 
 
 def format_meeting_with_weekday(
@@ -342,14 +380,19 @@ def render_subject(schedule: ScheduleInfo, department: str) -> str:
 
 
 def prepare_mails(
-    schedule: ScheduleInfo,
+    schedules: dict[str, ScheduleInfo],
     venues: tuple[str, ...] = VENUES,
     test_mode: bool = True,
 ) -> list[PreparedMail]:
-    body = render_body(schedule)
     prepared: list[PreparedMail] = []
 
     for venue in venues:
+        schedule = schedules.get(venue)
+        if schedule is None:
+            logging.warning("略過館別 %s：MAIL內文 無此館日期", venue)
+            continue
+        body = render_body(schedule)
+
         for dept in load_department_mails(venue):
             subject = render_subject(schedule, dept.department)
             if not dept.attachments:
@@ -534,19 +577,18 @@ def run(
     logging.info("寄件帳號=%s（SMTP 伺服器寄出）", SENDER_ACCOUNT)
     logging.info("log=%s", log_path)
 
-    schedule = load_schedule(month, western_year=western_year)
-    logging.info(
-        "開會=%s | 繳交=%s",
-        schedule.meeting_with_weekday,
-        schedule.deadline,
-    )
-    logging.info(
-        "主旨範例: %s",
-        render_subject(schedule, "客務部"),
-    )
-    logging.info("內文範例:\n%s", render_body(schedule))
+    schedules = load_schedules(month, western_year=western_year)
+    for venue, schedule in schedules.items():
+        logging.info(
+            "%s | 開會=%s | 繳交=%s",
+            venue,
+            schedule.meeting_with_weekday,
+            schedule.deadline,
+        )
+        logging.info("%s 主旨範例: %s", venue, render_subject(schedule, "客務部"))
+        logging.info("%s 內文範例:\n%s", venue, render_body(schedule))
 
-    mails = prepare_mails(schedule, venues=venues, test_mode=test_mode)
+    mails = prepare_mails(schedules, venues=venues, test_mode=test_mode)
     if limit is not None:
         mails = mails[:limit]
 
