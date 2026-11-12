@@ -28,6 +28,13 @@ from finance_tools.paths import (
 VENUES = ("台北", "南投", "高雄")
 SENDER_ACCOUNT = "hilai.aiagent@grand-hilai.com.tw"
 MIS_ADDRESS = "mis@grand-hilai.com.tw"
+STAKEHOLDER_TEST_RECIPIENTS: tuple[str, ...] = (
+    "marciecha@grand-hilai.com.tw",
+    "euniceho@grand-hilai.com.tw",
+    "annalien@grand-hilai.com.tw",
+    "ting369@grand-hilai.com.tw",
+)
+STAKEHOLDER_TEST_SUBJECT_PREFIX = "測試"
 
 WEEKDAY_ZH = ("一", "二", "三", "四", "五", "六", "日")
 
@@ -383,6 +390,9 @@ def prepare_mails(
     schedules: dict[str, ScheduleInfo],
     venues: tuple[str, ...] = VENUES,
     test_mode: bool = True,
+    test_recipients: tuple[str, ...] | None = None,
+    subject_prefix: str = "",
+    per_venue_limit: int | None = None,
 ) -> list[PreparedMail]:
     prepared: list[PreparedMail] = []
 
@@ -393,8 +403,14 @@ def prepare_mails(
             continue
         body = render_body(schedule)
 
-        for dept in load_department_mails(venue):
+        depts = load_department_mails(venue)
+        if per_venue_limit is not None:
+            depts = depts[:per_venue_limit]
+
+        for dept in depts:
             subject = render_subject(schedule, dept.department)
+            if subject_prefix:
+                subject = f"{subject_prefix}{subject}"
             if not dept.attachments:
                 prepared.append(
                     PreparedMail(
@@ -411,7 +427,7 @@ def prepare_mails(
                 continue
 
             if test_mode:
-                to_addrs = [MIS_ADDRESS]
+                to_addrs = list(test_recipients) if test_recipients else [MIS_ADDRESS]
                 cc_addrs: list[str] = []
             else:
                 to_addrs = list(dept.to_addrs)
@@ -563,9 +579,22 @@ def run(
     review_month: int | None = None,
     limit: int | None = None,
     verbose: bool = False,
+    stakeholder_test: bool = False,
+    per_venue_limit: int | None = None,
 ) -> int:
     log_path = _setup_logging(verbose=verbose)
     western_year, month = resolve_review_period(review_month=review_month)
+    test_recipients: tuple[str, ...] | None = None
+    subject_prefix = ""
+    if stakeholder_test:
+        test_recipients = STAKEHOLDER_TEST_RECIPIENTS
+        subject_prefix = STAKEHOLDER_TEST_SUBJECT_PREFIX
+        logging.info(
+            "stakeholder_test=True | subject_prefix=%s | To=%s",
+            subject_prefix,
+            ";".join(test_recipients),
+        )
+
     logging.info(
         "費用檢討=%s.%s (民國%s) | test_mode=%s | dry_run=%s",
         western_year,
@@ -588,7 +617,17 @@ def run(
         logging.info("%s 主旨範例: %s", venue, render_subject(schedule, "客務部"))
         logging.info("%s 內文範例:\n%s", venue, render_body(schedule))
 
-    mails = prepare_mails(schedules, venues=venues, test_mode=test_mode)
+    if per_venue_limit is not None:
+        logging.info("per_venue_limit=%s（每館依 MAIL 表順序取前 N 個部門）", per_venue_limit)
+
+    mails = prepare_mails(
+        schedules,
+        venues=venues,
+        test_mode=test_mode,
+        test_recipients=test_recipients,
+        subject_prefix=subject_prefix,
+        per_venue_limit=per_venue_limit,
+    )
     if limit is not None:
         mails = mails[:limit]
 
@@ -634,6 +673,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="正式模式：依 MAIL_台北/南投/高雄 寄給各部門，並同步 CC mis@",
     )
     p.add_argument(
+        "--stakeholder-test",
+        action="store_true",
+        help=(
+            "業務試寄：主旨前加「測試」、三館全部群組，"
+            "收件人為 marciecha/euniceho/annalien/ting369（非 mis@）"
+        ),
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="只組信與記錄，不實際寄出",
@@ -653,14 +700,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--limit",
         type=int,
-        help="最多處理幾封（測試用）",
+        help="最多處理幾封（全館合計，依處理順序截斷）",
+    )
+    p.add_argument(
+        "--per-venue-limit",
+        type=int,
+        metavar="N",
+        help="每館最多處理幾個部門（依 MAIL_館別.xlsx 列順序，三館各 N 封）",
     )
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.prod and args.stakeholder_test:
+        parser.error("不可同時使用 --prod 與 --stakeholder-test")
     test_mode = not args.prod
     return run(
         test_mode=test_mode,
@@ -669,6 +725,8 @@ def main(argv: list[str] | None = None) -> int:
         review_month=args.review_month,
         limit=args.limit,
         verbose=args.verbose,
+        stakeholder_test=args.stakeholder_test,
+        per_venue_limit=args.per_venue_limit,
     )
 
 
